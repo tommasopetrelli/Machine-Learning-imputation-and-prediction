@@ -14,7 +14,7 @@ no_target_B  <- !has_target_B
 train_df_B <- dataset_A_imputed[has_target_B, , drop = FALSE]
 
 # ---------------------------------------------------------------------
-# B.2 Define predictor set (parallel to CatBoost style, but with _B)
+# B.2 Define predictor set
 # ---------------------------------------------------------------------
 all_vars_B <- names(dataset_A_imputed)
 
