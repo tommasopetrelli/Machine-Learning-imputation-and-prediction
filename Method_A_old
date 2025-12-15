@@ -1,0 +1,180 @@
+# ===============================================================
+# Load required packages
+# ===============================================================
+
+if (!requireNamespace("missRanger")) install.packages("missRanger")
+if (!requireNamespace("ranger")) install.packages("ranger")
+if (!requireNamespace("dplyr")) install.packages("dplyr")
+if (!requireNamespace("haven")) install.packages("haven")
+if (!requireNamespace("forcats")) install.packages("forcats")
+if (!requireNamespace("ggplot2")) install.packages("ggplot2")
+
+library(missRanger)
+library(ranger)
+library(dplyr)
+library(haven)
+library(forcats)
+library(ggplot2)
+
+# ===============================================================
+# BLOCK A: Q8A imputation + midpoints
+# ===============================================================
+
+# A.1 Load & initial filtering ----------------------------------------------
+dataset_A <- read_dta("C:/Users/RDS-petreto/Desktop/Financing Gap/safepanel_allrounds.dta") %>%
+  filter(wave > 10, !wave %in% c(31, 33, 35)) %>%
+  filter(d0 %in% c("BE", "DK", "DE", "EE", "IE",
+                   "GR", "ES", "FR", "HR", "IT", "CY", "LV", "LT", "LU", "MT",
+                   "NL", "AT", "PL", "PT", "RO", "SI", "SK", "FI", "SE", "BG",
+                   "CZ", "HU"))
+
+write_dta(dataset_A, "Dataset_test_V11.dta")
+
+# A.2 Define target variable Q8A --------------------------------------------
+
+dataset_A <- dataset_A %>%
+  mutate(Q8A_target = as.factor(haven::as_factor(q8a)))
+
+# A.3 Convert ALL predictors to factors
+predictors_A <- dataset_A %>% 
+  select(-q8a, -Q8A_target)
+
+predictors_A <- predictors_A %>%
+  mutate(across(everything(), ~ as.factor(as.character(.))))
+
+
+# A.4 Filters: near zero variance, one level factors, high missingness -------
+
+one_level <- sapply(predictors_A, function(x) is.factor(x) && nlevels(x) <= 1)
+predictors_A <- predictors_A[, !one_level, drop = FALSE]
+
+non_missing_threshold <- 0.70               
+non_na_pct <- colMeans(!is.na(predictors_A))
+
+predictors_A <- predictors_A[, non_na_pct >= non_missing_threshold, drop = FALSE]
+cat("Variables kept after filtering:", ncol(predictors_A), "\n")
+
+vars_to_drop <- c("d7_rec", "intdate", "q2_j_rec", "q4_a_rec","q4_b_rec",
+                  "q4_c_rec", "q4_d_rec", "q4_e_rec", "q4_f_rec", "q4_h_rec",
+                  "q4_j_rec", "q4_m_rec", "q4_p_rec", "q4_r_rec")
+predictors_A <- predictors_A[, !names(predictors_A) %in% vars_to_drop, drop = FALSE]
+
+predictors_A_keep <- predictors_A
+
+# A.5 Impute predictors with missRanger ------------------------------------
+
+set.seed(123)
+X_A <- missRanger(
+  predictors_A_keep,
+  num.trees = 500,
+  num.threads = parallel::detectCores(),
+  pmm.k = 3,
+  )
+
+# A.6 Train final RF on all remaining predictors --------------------------------
+
+
+Y_A <- dataset_A$Q8A_target
+train_idx_A <- which(!is.na(Y_A))
+
+train_data_A <- data.frame(
+  Q8A_class = Y_A[train_idx_A],
+  X_A[train_idx_A, , drop = FALSE]
+)
+
+set.seed(123)
+rf_q8a_model <- ranger(
+  Q8A_class ~ .,
+  data       = train_data_A,
+  num.trees  = 500,
+  importance = "impurity",
+  num.threads = parallel::detectCores()
+)
+
+# A.7 Predict missing Q8A ---------------------------------------------------
+
+missing_idx_A <- which(is.na(Y_A))
+
+dataset_A$Q8A_class_pred <- dataset_A$Q8A_target
+
+if (length(missing_idx_A) > 0) {
+  pred_A <- predict(
+    rf_q8a_model,
+    data = X_A[missing_idx_A, , drop = FALSE]   # <-- FIXED HERE
+  )$predictions
+  
+  dataset_A$Q8A_class_pred[missing_idx_A] <- pred_A
+}
+
+# A.8 Midpoints mapping (UNCHANGED)
+
+midpoints_map <- c("1" = 12500, "2" = 62500, "4" = 175000, "5" = 625000)
+
+dataset_A <- dataset_A %>%
+  mutate(
+    Q8A_class_chr = as.character(Q8A_class_pred),
+    Q8A_pred_midpoint = ifelse(Q8A_class_chr %in% names(midpoints_map),
+                               as.numeric(midpoints_map[Q8A_class_chr]),
+                               NA_real_)
+  ) %>%
+  mutate(
+    Q8A_pred_midpoint = case_when(
+      Q8A_class_pred == "6" & d1_rec == 1 ~ 1250000,
+      Q8A_class_pred == "6" & d1_rec == 2 ~ 1750000,
+      Q8A_class_pred == "6" & d1_rec == 3 ~ 2500000,
+      Q8A_class_pred == "6" & d1_rec == 4 ~ 4000000,
+      TRUE ~ Q8A_pred_midpoint
+    )
+  )
+
+
+# A.9 Ordinal mapping (UNCHANGED)
+
+dataset_A <- dataset_A %>%
+  mutate(
+    Q8A_class_ord = case_when(
+      Q8A_class_pred == "1" ~ 1,
+      Q8A_class_pred == "2" ~ 2,
+      Q8A_class_pred == "4" ~ 3,
+      Q8A_class_pred == "5" ~ 4,
+      Q8A_class_pred == "6" ~ 5,
+      TRUE ~ NA_real_
+    )
+  )
+
+
+# A.10 Summaries (UNCHANGED)
+
+statistiche_q8a_class_pred <- dataset_A %>%
+  group_by(wave) %>%
+  summarise(
+    mean_q8a_pred = mean(Q8A_pred_midpoint, na.rm = TRUE),
+    median_q8a_pred = median(Q8A_pred_midpoint, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(statistiche_q8a_class_pred, n = 25)
+
+statistiche_ordinale <- dataset_A %>%
+  group_by(wave) %>%
+  summarise(
+    mean_q8a_ord = mean(Q8A_class_ord, na.rm = TRUE),
+    median_q8a_ord = median(Q8A_class_ord, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(statistiche_ordinale, n = 25)
+
+
+# A.11 Save final dataset (UNCHANGED)
+
+write_dta(dataset_A,
+          path = "C:/Users/RDS-petreto/Desktop/Financing Gap/Q8a_Imputed_V10.dta")
+
+
+# ===============================================================
+# BLOCK B: Testing: OOB
+# ===============================================================
+
+# B.1 Q8a imputation OOB error (A.6)
+
+q8a_oob <- rf_q8a_model$prediction.error
+cat("Q8A OOB error:", q8a_oob, "\n")
